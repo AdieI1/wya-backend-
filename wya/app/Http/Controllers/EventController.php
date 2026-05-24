@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers;
 
+use App\Models\AttendanceLog;
 use App\Models\AttendanceStatus;
 use App\Models\CancelledEvent;
 use App\Models\Event;
@@ -9,6 +10,7 @@ use App\Models\EventParticipant;
 use App\Models\EventSession;
 use App\Models\EventStatus;
 use App\Models\EventType;
+use App\Services\AttendanceService;
 use Carbon\Carbon;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -17,6 +19,11 @@ use Illuminate\Support\Str;
 
 class EventController extends Controller
 {
+    private function attendance(): AttendanceService
+    {
+        return app(AttendanceService::class);
+    }
+
     public function feed(Request $request): JsonResponse
     {
         $user = $request->user();
@@ -44,9 +51,15 @@ class EventController extends Controller
             default => $created->concat($joined)->unique('id')->sortByDesc('event_date')->values(),
         };
 
+        $active = $events->filter(function (Event $event) {
+            $phase = $this->attendance()->resolveEventPhase($event);
+
+            return in_array($phase, ['upcoming', 'ongoing'], true);
+        })->values();
+
         return response()->json([
             'filter' => $filter,
-            'events' => $events->map(fn (Event $event) => $this->formatEvent($event, $user)),
+            'events' => $active->map(fn (Event $event) => $this->formatEvent($event, $user)),
         ]);
     }
 
@@ -228,16 +241,36 @@ class EventController extends Controller
 
     public function history(Request $request): JsonResponse
     {
-        $creatorId = $request->user()->id;
+        $user = $request->user();
+        $filter = $request->query('filter', 'all');
+        $cancelledId = $this->statusId('cancelled');
 
-        $events = Event::query()
+        $createdQuery = Event::query()
             ->with(['eventType', 'status', 'sessions', 'cancellation'])
-            ->where('creator_id', $creatorId)
-            ->orderByDesc('event_date')
-            ->get();
+            ->where('creator_id', $user->id)
+            ->when($cancelledId, fn ($q) => $q->where('status_id', '!=', $cancelledId));
+
+        $joinedQuery = Event::query()
+            ->with(['eventType', 'status', 'sessions', 'cancellation'])
+            ->whereHas('participants', fn ($q) => $q->where('user_id', $user->id))
+            ->where('creator_id', '!=', $user->id)
+            ->when($cancelledId, fn ($q) => $q->where('status_id', '!=', $cancelledId));
+
+        $events = match ($filter) {
+            'created' => $createdQuery->get(),
+            'joined' => $joinedQuery->get(),
+            default => $createdQuery->get()->concat($joinedQuery->get())->unique('id'),
+        };
+
+        $finished = $events->filter(function (Event $event) {
+            return $this->attendance()->resolveEventPhase($event) === 'completed';
+        })->sortByDesc('event_date')->values();
 
         return response()->json([
-            'events' => $events->map(fn (Event $event) => $this->formatEvent($event, $request->user())),
+            'filter' => $filter,
+            'events' => $finished->map(
+                fn (Event $event) => $this->formatEvent($event, $user, true)
+            ),
         ]);
     }
 
@@ -246,8 +279,183 @@ class EventController extends Controller
         $event = Event::with(['eventType', 'status', 'sessions', 'cancellation'])
             ->findOrFail($id);
 
+        $user = $request->user();
+        $payload = [
+            'event' => $this->formatEvent($event, $user),
+        ];
+
+        $participant = EventParticipant::where('event_id', $event->id)
+            ->where('user_id', $user->id)
+            ->first();
+
+        if ($participant && $event->creator_id !== $user->id) {
+            $logs = AttendanceLog::where('participant_id', $participant->id)->get()->keyBy('session_id');
+            $sessions = $event->sessions->map(
+                fn (EventSession $session) => $this->attendance()->formatLogForSession(
+                    $session,
+                    $logs->get($session->id),
+                    $event
+                )
+            );
+
+            $sessionStatuses = $event->sessions->map(
+                fn (EventSession $session) => $this->attendance()->resolveSessionStatus(
+                    $session,
+                    $logs->get($session->id)
+                )
+            )->all();
+
+            $payload['my_attendance'] = [
+                'sessions' => $sessions->values(),
+                'overall_status' => $this->attendance()->rollupStatuses($sessionStatuses ?: ['registered']),
+            ];
+        }
+
+        if ($event->creator_id === $user->id) {
+            $participants = EventParticipant::with(['user', 'attendanceLogs'])
+                ->where('event_id', $event->id)
+                ->get();
+
+            $payload['participant_count'] = $participants->count();
+            $payload['status_counts'] = $this->attendance()->countStatuses($event, $participants);
+            $payload['participant_preview'] = $participants
+                ->take(5)
+                ->map(fn (EventParticipant $p) => $this->attendance()->formatParticipantRow(
+                    $p,
+                    $event,
+                    $this->attendance()->resolveEventPhase($event)
+                ))
+                ->values();
+        }
+
+        return response()->json($payload);
+    }
+
+    public function timeIn(Request $request, int $id, int $sessionId): JsonResponse
+    {
+        $event = Event::with('sessions')->findOrFail($id);
+        $user = $request->user();
+
+        $participant = EventParticipant::where('event_id', $event->id)
+            ->where('user_id', $user->id)
+            ->first();
+
+        if (! $participant) {
+            return response()->json(['message' => 'You have not joined this event.'], 403);
+        }
+
+        if ($event->creator_id === $user->id) {
+            return response()->json(['message' => 'Organizers cannot time in as participants.'], 422);
+        }
+
+        $session = $event->sessions->firstWhere('id', $sessionId);
+        if (! $session) {
+            return response()->json(['message' => 'Session not found.'], 404);
+        }
+
+        $log = AttendanceLog::firstOrNew([
+            'participant_id' => $participant->id,
+            'session_id' => $session->id,
+        ]);
+
+        $check = $this->attendance()->canTimeIn($session, $log);
+        if (! $check['allowed']) {
+            return response()->json(['message' => $check['reason']], 422);
+        }
+
+        $now = now();
+        $status = $this->attendance()->checkInStatus($now, $session->start_datetime);
+
+        $log->time_in = $now;
+        $log->status = $status;
+        $log->save();
+
+        $this->attendance()->syncParticipantStatus($participant, $event);
+
         return response()->json([
-            'event' => $this->formatEvent($event, $request->user()),
+            'message' => 'Timed in successfully.',
+            'session' => $this->attendance()->formatLogForSession($session, $log->fresh(), $event),
+        ]);
+    }
+
+    public function timeOut(Request $request, int $id, int $sessionId): JsonResponse
+    {
+        $event = Event::with('sessions')->findOrFail($id);
+        $user = $request->user();
+
+        $participant = EventParticipant::where('event_id', $event->id)
+            ->where('user_id', $user->id)
+            ->first();
+
+        if (! $participant) {
+            return response()->json(['message' => 'You have not joined this event.'], 403);
+        }
+
+        $session = $event->sessions->firstWhere('id', $sessionId);
+        if (! $session) {
+            return response()->json(['message' => 'Session not found.'], 404);
+        }
+
+        $log = AttendanceLog::where('participant_id', $participant->id)
+            ->where('session_id', $session->id)
+            ->first();
+
+        if (! $log?->time_in) {
+            return response()->json(['message' => 'You must time in first.'], 422);
+        }
+
+        $check = $this->attendance()->canTimeOut($session, $log);
+        if (! $check['allowed']) {
+            return response()->json(['message' => $check['reason']], 422);
+        }
+
+        $log->time_out = now();
+        $log->save();
+
+        $this->attendance()->syncParticipantStatus($participant, $event);
+
+        return response()->json([
+            'message' => 'Timed out successfully.',
+            'session' => $this->attendance()->formatLogForSession($session, $log->fresh(), $event),
+        ]);
+    }
+
+    public function participants(Request $request, int $id): JsonResponse
+    {
+        $event = Event::with(['sessions', 'status'])->findOrFail($id);
+        $this->authorizeCreator($request, $event);
+
+        $sort = $request->query('sort', 'az');
+        $search = trim((string) $request->query('search', ''));
+
+        $participants = EventParticipant::with(['user', 'attendanceLogs'])
+            ->where('event_id', $event->id)
+            ->get();
+
+        $phase = $this->attendance()->resolveEventPhase($event);
+
+        $rows = $participants->map(
+            fn (EventParticipant $p) => $this->attendance()->formatParticipantRow($p, $event, $phase)
+        );
+
+        if ($search !== '') {
+            $needle = strtolower($search);
+            $rows = $rows->filter(
+                fn (array $row) => str_contains(strtolower($row['name']), $needle)
+            );
+        }
+
+        $rows = match ($sort) {
+            'time_in_asc' => $rows->sortBy(fn (array $row) => $row['time_in_sort'] ?? PHP_INT_MAX),
+            'time_in_desc' => $rows->sortByDesc(fn (array $row) => $row['time_in_sort'] ?? 0),
+            default => $rows->sortBy(fn (array $row) => strtolower($row['name'])),
+        };
+
+        return response()->json([
+            'event_id' => $event->id,
+            'phase' => $phase,
+            'status_counts' => $this->attendance()->countStatuses($event, $participants),
+            'participants' => $rows->values(),
         ]);
     }
 
@@ -534,23 +742,32 @@ class EventController extends Controller
         ];
     }
 
-    private function formatEvent(Event $event, $user = null): array
+    private function formatEvent(Event $event, $user = null, bool $withAttendance = false): array
     {
         $sessions = $event->sessions->map(fn (EventSession $s) => [
             'id' => $s->id,
             'session_label' => $s->session_label,
             'start_datetime' => $s->start_datetime?->toIso8601String(),
             'end_datetime' => $s->end_datetime?->toIso8601String(),
-            'time_in' => $s->start_datetime?->format('H:i'),
-            'time_out' => $s->end_datetime?->format('H:i'),
+            'time_in' => $s->start_datetime?->format('g:i A'),
+            'time_out' => $s->end_datetime?->format('g:i A'),
         ])->values();
 
         $isCreator = $user && $event->creator_id === $user->id;
-        $isJoined = $user && ! $isCreator && EventParticipant::where('event_id', $event->id)
-            ->where('user_id', $user->id)
-            ->exists();
+        $participant = $user
+            ? EventParticipant::with('attendanceStatus')
+                ->where('event_id', $event->id)
+                ->where('user_id', $user->id)
+                ->first()
+            : null;
+        $isJoined = $participant && ! $isCreator;
 
-        return [
+        $phase = $this->attendance()->resolveEventPhase($event);
+        $displayStatus = $phase === 'cancelled'
+            ? 'cancelled'
+            : ($phase === 'completed' ? 'completed' : $phase);
+
+        $payload = [
             'id' => $event->id,
             'creator_id' => $event->creator_id,
             'event_code' => $event->event_code,
@@ -562,7 +779,8 @@ class EventController extends Controller
             'event_type_id' => $event->event_type_id,
             'event_type' => $event->eventType?->type_name,
             'status_id' => $event->status_id,
-            'status' => $event->status?->status_name ?? 'upcoming',
+            'status' => $displayStatus,
+            'phase' => $phase,
             'capacity' => $event->capacity,
             'unlimited_capacity' => $event->unlimited_capacity,
             'allow_late_checkin' => $event->allow_late_checkin,
@@ -570,6 +788,7 @@ class EventController extends Controller
             'join_policy' => $event->join_policy,
             'banner_image' => $event->banner_image,
             'sessions' => $sessions,
+            'participant_count' => EventParticipant::where('event_id', $event->id)->count(),
             'cancellation' => $event->cancellation ? [
                 'cancellation_reason' => $event->cancellation->cancellation_reason,
                 'cancelled_at' => $event->cancellation->created_at?->toIso8601String(),
@@ -577,5 +796,28 @@ class EventController extends Controller
             'created_at' => $event->created_at?->toIso8601String(),
             'updated_at' => $event->updated_at?->toIso8601String(),
         ];
+
+        if ($withAttendance && $user) {
+            if ($isJoined && $participant) {
+                $logs = AttendanceLog::where('participant_id', $participant->id)
+                    ->get()
+                    ->keyBy('session_id');
+                $sessionStatuses = $event->sessions->map(
+                    fn (EventSession $session) => $this->attendance()->resolveSessionStatus(
+                        $session,
+                        $logs->get($session->id)
+                    )
+                )->all();
+                $payload['my_attendance_status'] = $this->attendance()->rollupStatuses(
+                    $sessionStatuses ?: ['registered']
+                );
+            } elseif ($isCreator) {
+                $payload['my_attendance_status'] = $phase === 'completed'
+                    ? 'completed'
+                    : null;
+            }
+        }
+
+        return $payload;
     }
 }

@@ -9,7 +9,7 @@ class AttendanceLookupSeeder extends Seeder
 {
     public function run(): void
     {
-        foreach (['registered', 'present', 'absent', 'late'] as $status) {
+        foreach (['registered', 'present', 'absent', 'late', 'incomplete'] as $status) {
             AttendanceStatus::firstOrCreate(['status_name' => $status]);
         }
     }
